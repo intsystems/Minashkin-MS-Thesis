@@ -111,7 +111,7 @@ __pycache__/
 .gitignore
 # Exclude folders with name logs:
 logs/
- 
+
 # Exclude all .dat files:
 *.dat
 # Exclude all files which begin on .
@@ -120,3 +120,5 @@ logs/
 */mnist
 *.csv
 !.dvc
+code/data/*
+#code/results/*
