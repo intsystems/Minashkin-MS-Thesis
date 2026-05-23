@@ -6,31 +6,64 @@ import torchvision.transforms as transforms
 from torch.utils.data import DataLoader
 import tqdm
 from typing import Tuple
+import os
 
 from models import UNet, MLPNet
 
 
 def get_c_function(c_type: str, a: float = 0.8, b: float = 2.0):
     if c_type == "linear":
+
         def c(gamma):
             return 1 - gamma
 
     elif c_type == "truncated":
+
         def c(gamma):
-            return torch.where(gamma <= a,
-                             torch.ones_like(gamma),
-                             (1 - gamma) / (1 - a))
+            return torch.where(
+                gamma <= a, torch.ones_like(gamma), (1 - gamma) / (1 - a)
+            )
 
     elif c_type == "piecewise":
+
         def c(gamma):
-            return torch.where(gamma <= a,
-                             b - (b - 1) / a * gamma,
-                             (1 - gamma) / (1 - a))
+            return torch.where(
+                gamma <= a, b - (b - 1) / a * gamma, (1 - gamma) / (1 - a)
+            )
 
     else:
         raise ValueError(f"Unknown c_type: {c_type}")
 
     return c
+
+def get_gamma_scheduler(schedule_type: str):
+    """Возвращает функцию для сэмплирования gamma."""
+    if schedule_type == "uniform":
+        def sampler(batch_size, device):
+            return torch.rand(batch_size, device=device)
+
+    elif schedule_type == "linear_decay":
+        # Вероятность пропорциональна (1 - gamma) -> чаще видим зашумленные (gamma -> 0)
+        def sampler(batch_size, device):
+            u = torch.rand(batch_size, device=device)
+            return 1.0 - torch.sqrt(1.0 - u)
+
+    elif schedule_type == "linear_grow":
+        # Вероятность пропорциональна gamma -> чаще видим чистые данные (gamma -> 1)
+        def sampler(batch_size, device):
+            u = torch.rand(batch_size, device=device)
+            return torch.sqrt(u)
+
+    elif schedule_type == "beta":
+        # Гладкое смещение в сторону чистых данных (gamma -> 1)
+        def sampler(batch_size, device):
+            m = torch.distributions.Beta(1.0, 0.25)
+            return m.sample((batch_size,)).to(device)
+
+    else:
+        raise ValueError(f"Unknown gamma_schedule: {schedule_type}")
+
+    return sampler
 
 class EqMTrainer:
     def __init__(self, config):
@@ -47,25 +80,36 @@ class EqMTrainer:
 
         self.c_func = get_c_function(config.c_type, config.c_a, config.c_b)
 
+        self.gamma_sampler = get_gamma_scheduler(getattr(config, 'gamma_schedule', 'uniform'))
+
         self.train_losses = []
 
     def _get_data(self):
-        transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize((0.5,), (0.5,))
-        ])
+        transform = transforms.Compose(
+            [transforms.ToTensor(), transforms.Normalize((0.5,), (0.5,))]
+        )
 
         train_dataset = torchvision.datasets.MNIST(
-            root='./data', train=True, download=True, transform=transform
+            root="./data", train=True, download=True, transform=transform
         )
         test_dataset = torchvision.datasets.MNIST(
-            root='./data', train=False, download=True, transform=transform
+            root="./data", train=False, download=True, transform=transform
         )
 
-        train_loader = DataLoader(train_dataset, batch_size=self.config.batch_size,
-                                shuffle=True, num_workers=self.config.num_workers, pin_memory=True)
-        test_loader = DataLoader(test_dataset, batch_size=self.config.batch_size,
-                               shuffle=False, num_workers=self.config.num_workers, pin_memory=True)
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=self.config.batch_size,
+            shuffle=True,
+            num_workers=self.config.num_workers,
+            pin_memory=True,
+        )
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=self.config.batch_size,
+            shuffle=False,
+            num_workers=self.config.num_workers,
+            pin_memory=True,
+        )
 
         return train_loader, test_loader
 
@@ -80,9 +124,12 @@ class EqMTrainer:
 
             noise = torch.randn_like(data)
 
-            gamma = torch.rand(batch_size, device=self.config.device)
+            # gamma = torch.rand(batch_size, device=self.config.device)
+            gamma = self.gamma_sampler(batch_size, self.config.device)
 
-            x_gamma = gamma.view(-1, 1, 1, 1) * data + (1 - gamma.view(-1, 1, 1, 1)) * noise
+            x_gamma = (
+                gamma.view(-1, 1, 1, 1) * data + (1 - gamma.view(-1, 1, 1, 1)) * noise
+            )
 
             c_gamma = self.c_func(gamma) * self.config.grad_multiplier
             target = (noise - data) * c_gamma.view(-1, 1, 1, 1)
@@ -99,9 +146,7 @@ class EqMTrainer:
             total_loss += loss.item()
 
             if batch_idx % self.config.log_interval == 0:
-                pbar.set_postfix({'loss': loss.item()})
-
-            break
+                pbar.set_postfix({"loss": loss.item()})
 
         avg_loss = total_loss / len(self.train_loader)
         self.train_losses.append(avg_loss)
@@ -119,18 +164,35 @@ class EqMTrainer:
                 grad_norm = grad.norm(dim=1).mean().item()
                 total_grad_norm += grad_norm
 
-                break
-
         avg_grad_norm = total_grad_norm / len(self.test_loader)
         return avg_grad_norm
+
+    def load_checkpoint(self, checkpoint_path):
+        """Load model weights from checkpoint."""
+        if os.path.exists(checkpoint_path):
+            print(f"Loading checkpoint from {checkpoint_path}")
+            self.model.load_state_dict(
+                torch.load(checkpoint_path, map_location=self.config.device)
+            )
+            print("Checkpoint loaded successfully")
+        else:
+            print(
+                f"Warning: Checkpoint file {checkpoint_path} not found. Starting from scratch."
+            )
+
 
 class EqMSampler:
     def __init__(self, model, config):
         self.model = model
         self.config = config
 
-    def sample_gd(self, init_samples: torch.Tensor, steps: int = None,
-                  step_size: float = None, return_trajectory: bool = False) -> torch.Tensor:
+    def sample_gd(
+        self,
+        init_samples: torch.Tensor,
+        steps: int = None,
+        step_size: float = None,
+        return_trajectory: bool = False,
+    ) -> torch.Tensor:
         if steps is None:
             steps = self.config.sample_steps
         if step_size is None:
@@ -152,9 +214,14 @@ class EqMSampler:
             return x, trajectory
         return x
 
-    def sample_nag(self, init_samples: torch.Tensor, steps: int = None,
-                   step_size: float = None, mu: float = None,
-                   return_trajectory: bool = False) -> torch.Tensor:
+    def sample_nag(
+        self,
+        init_samples: torch.Tensor,
+        steps: int = None,
+        step_size: float = None,
+        mu: float = None,
+        return_trajectory: bool = False,
+    ) -> torch.Tensor:
         if steps is None:
             steps = self.config.sample_steps
         if step_size is None:
@@ -183,9 +250,14 @@ class EqMSampler:
             return x, trajectory
         return x
 
-    def sample_muon(self, init_samples: torch.Tensor, steps: int = None,
-                step_size: float = None, momentum: float = 0.95,
-                return_trajectory: bool = False) -> torch.Tensor:
+    def sample_muon(
+        self,
+        init_samples: torch.Tensor,
+        steps: int = None,
+        step_size: float = None,
+        momentum: float = 0.95,
+        return_trajectory: bool = False,
+    ) -> torch.Tensor:
         if steps is None:
             steps = self.config.sample_steps
         if step_size is None:
@@ -201,7 +273,9 @@ class EqMSampler:
                 grad = self.model(x)
 
                 if i > 0 and momentum_buffer.norm() > 1e-8:
-                    projection = (grad * momentum_buffer).sum() / (momentum_buffer.norm()**2)
+                    projection = (grad * momentum_buffer).sum() / (
+                        momentum_buffer.norm() ** 2
+                    )
                     grad = grad - projection * momentum_buffer
 
                 momentum_buffer = momentum * momentum_buffer + grad
@@ -215,9 +289,13 @@ class EqMSampler:
             return x, trajectory
         return x
 
-
-    def sample_adaptive(self, init_samples: torch.Tensor, step_size: float = None,
-                       threshold: float = None, max_steps: int = 100) -> Tuple[torch.Tensor, int]:
+    def sample_adaptive(
+        self,
+        init_samples: torch.Tensor,
+        step_size: float = None,
+        threshold: float = None,
+        max_steps: int = 100,
+    ) -> Tuple[torch.Tensor, int]:
         if step_size is None:
             step_size = self.config.step_size
         if threshold is None:
