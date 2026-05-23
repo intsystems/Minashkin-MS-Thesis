@@ -11,11 +11,11 @@ import os
 from models import UNet, MLPNet
 
 
-def get_c_function(c_type: str, a: float = 0.8, b: float = 2.0):
+def get_c_function(c_type: str, a: float = 0.8, b: float = 2.0, q: float = 1.0):
     if c_type == "linear":
 
         def c(gamma):
-            return 1 - gamma
+            return (1 - gamma) ** q
 
     elif c_type == "truncated":
 
@@ -78,7 +78,7 @@ class EqMTrainer:
 
         self.optimizer = torch.optim.AdamW(self.model.parameters(), lr=config.lr)
 
-        self.c_func = get_c_function(config.c_type, config.c_a, config.c_b)
+        self.c_func = get_c_function(config.c_type, config.c_a, config.c_b, getattr(config, 'c_q', 1.0))
 
         self.gamma_sampler = get_gamma_scheduler(getattr(config, 'gamma_schedule', 'uniform'))
 

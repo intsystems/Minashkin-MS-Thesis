@@ -29,6 +29,7 @@ class Config:
     c_type = "linear"  # "linear", "truncated", "piecewise"
     c_a = 0.8
     c_b = 2.0
+    c_q = 1.0
     grad_multiplier = 4.0
 
     gamma_schedule = "beta" # "uniform", "linear_decay", "linear_grow", "beta"
@@ -47,7 +48,7 @@ class Config:
     fid_on_gif = False
 
     log_interval = 5
-    vis_interval = 100
+    vis_interval = 1
     save_dir = "../figures"
 
     load_checkpoint_path = None  # code/eqm.pth
@@ -71,6 +72,7 @@ def main():
         "c_type": config.c_type,
         "c_a": config.c_a,
         "c_b": config.c_b,
+        "c_q": config.c_q,
         "gamma_schedule": getattr(config, 'gamma_schedule', 'uniform'), # Добавить сюда
         "grad_multiplier": config.grad_multiplier,
         "sample_steps": config.sample_steps,
